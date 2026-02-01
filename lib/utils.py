@@ -69,8 +69,10 @@ def train_readout_online(
     
     Args:
         network: AttentionDiffusionRNN instance.
-        inputs: Input sequence of shape (time_steps, input_dim).
-        targets: Target sequence of shape (time_steps, output_dim).
+        inputs: Input sequence(s) of shape (time_steps, input_dim) or 
+                (n_samples, time_steps, input_dim) for batches.
+        targets: Target sequence(s) of shape (time_steps, output_dim) or 
+                 (n_samples, time_steps, output_dim) for batches.
         learning_rate: Learning rate for gradient descent.
         n_epochs: Number of training epochs.
         apply_attention: Whether to apply attention mechanism.
@@ -79,31 +81,63 @@ def train_readout_online(
     Returns:
         List of mean squared errors per epoch.
     """
-    time_steps = inputs.shape[0]
     losses = []
     
-    for epoch in range(n_epochs):
-        network.reset_state()
-        epoch_loss = 0.0
+    # Handle batch input
+    if inputs.ndim == 3:
+        # Batch of sequences: (n_samples, time_steps, input_dim)
+        n_samples, time_steps, _ = inputs.shape
+        total_steps = n_samples * time_steps
         
-        for t in range(time_steps):
-            # Forward pass
-            output, state, _ = network.step(
-                inputs[t],
-                apply_attention=apply_attention,
-                apply_diffusion=apply_diffusion
-            )
+        for epoch in range(n_epochs):
+            network.reset_state()
+            epoch_loss = 0.0
             
-            # Compute error
-            target = targets[t]
-            error = output - target
-            epoch_loss += np.mean(error ** 2)
+            for i in range(n_samples):
+                for t in range(time_steps):
+                    # Forward pass
+                    output, state, _ = network.step(
+                        inputs[i, t],
+                        apply_attention=apply_attention,
+                        apply_diffusion=apply_diffusion
+                    )
+                    
+                    # Compute error
+                    target = targets[i, t]
+                    error = output - target
+                    epoch_loss += np.mean(error ** 2)
+                    
+                    # Gradient descent update
+                    network.W_out -= learning_rate * np.outer(error, state)
+                    network.b_out -= learning_rate * error
             
-            # Gradient descent update
-            network.W_out -= learning_rate * np.outer(error, state)
-            network.b_out -= learning_rate * error
+            losses.append(epoch_loss / total_steps)
+    else:
+        # Single sequence: (time_steps, input_dim)
+        time_steps = inputs.shape[0]
         
-        losses.append(epoch_loss / time_steps)
+        for epoch in range(n_epochs):
+            network.reset_state()
+            epoch_loss = 0.0
+            
+            for t in range(time_steps):
+                # Forward pass
+                output, state, _ = network.step(
+                    inputs[t],
+                    apply_attention=apply_attention,
+                    apply_diffusion=apply_diffusion
+                )
+                
+                # Compute error
+                target = targets[t]
+                error = output - target
+                epoch_loss += np.mean(error ** 2)
+                
+                # Gradient descent update
+                network.W_out -= learning_rate * np.outer(error, state)
+                network.b_out -= learning_rate * error
+            
+            losses.append(epoch_loss / time_steps)
     
     return losses
 
@@ -119,7 +153,8 @@ def collect_states(
     
     Args:
         network: AttentionDiffusionRNN instance.
-        inputs: Input sequence of shape (time_steps, input_dim).
+        inputs: Input sequence(s) of shape (time_steps, input_dim) or 
+                (n_samples, time_steps, input_dim) for batches.
         apply_attention: Whether to apply attention mechanism.
         apply_diffusion: Whether to apply diffusion mechanism.
         warmup_steps: Number of initial steps to discard (transient dynamics).
@@ -127,26 +162,71 @@ def collect_states(
     Returns:
         Dictionary containing collected states, outputs, and attentions.
     """
-    network.reset_state()
-    
-    # Run warmup
-    if warmup_steps > 0:
-        for t in range(warmup_steps):
-            network.step(
-                inputs[t],
+    # Handle batch input
+    if inputs.ndim == 3:
+        # Batch of sequences: (n_samples, time_steps, input_dim)
+        n_samples = inputs.shape[0]
+        all_states = []
+        all_outputs = []
+        all_attentions = []
+        
+        for i in range(n_samples):
+            network.reset_state()
+            
+            # Run warmup
+            if warmup_steps > 0:
+                for t in range(warmup_steps):
+                    network.step(
+                        inputs[i, t],
+                        apply_attention=apply_attention,
+                        apply_diffusion=apply_diffusion
+                    )
+            
+            # Collect states for this sample
+            result = network.forward(
+                inputs[i, warmup_steps:],
                 apply_attention=apply_attention,
-                apply_diffusion=apply_diffusion
+                apply_diffusion=apply_diffusion,
+                return_states=True
             )
-    
-    # Collect states
-    result = network.forward(
-        inputs[warmup_steps:],
-        apply_attention=apply_attention,
-        apply_diffusion=apply_diffusion,
-        return_states=True
-    )
-    
-    return result
+            
+            all_states.append(result['states'])
+            all_outputs.append(result['outputs'])
+            all_attentions.append(result['attentions'])
+        
+        # Concatenate all samples
+        attentions = np.vstack(all_attentions)
+        return {
+            'states': np.vstack(all_states),
+            'outputs': np.vstack(all_outputs),
+            'attentions': attentions,
+            'attention': attentions  # Alias for compatibility
+        }
+    else:
+        # Single sequence: (time_steps, input_dim)
+        network.reset_state()
+        
+        # Run warmup
+        if warmup_steps > 0:
+            for t in range(warmup_steps):
+                network.step(
+                    inputs[t],
+                    apply_attention=apply_attention,
+                    apply_diffusion=apply_diffusion
+                )
+        
+        # Collect states
+        result = network.forward(
+            inputs[warmup_steps:],
+            apply_attention=apply_attention,
+            apply_diffusion=apply_diffusion,
+            return_states=True
+        )
+        
+        # Add alias for compatibility
+        result['attention'] = result['attentions']
+        
+        return result
 
 
 def compute_mse(
@@ -218,8 +298,10 @@ def evaluate_network(
     
     Args:
         network: AttentionDiffusionRNN instance.
-        inputs: Input sequence of shape (time_steps, input_dim).
-        targets: Target sequence of shape (time_steps, output_dim).
+        inputs: Input sequence(s) of shape (time_steps, input_dim) or 
+                (n_samples, time_steps, input_dim) for batches.
+        targets: Target sequence(s) of shape (time_steps, output_dim) or 
+                 (n_samples, time_steps, output_dim) for batches.
         apply_attention: Whether to apply attention mechanism.
         apply_diffusion: Whether to apply diffusion mechanism.
         warmup_steps: Number of initial steps to discard.
@@ -227,26 +309,60 @@ def evaluate_network(
     Returns:
         Dictionary of evaluation metrics.
     """
-    network.reset_state()
-    
-    # Run warmup
-    if warmup_steps > 0:
-        for t in range(warmup_steps):
-            network.step(
-                inputs[t],
+    # Handle batch input
+    if inputs.ndim == 3:
+        # Batch of sequences: (n_samples, time_steps, input_dim)
+        n_samples = inputs.shape[0]
+        all_predictions = []
+        all_targets = []
+        
+        for i in range(n_samples):
+            network.reset_state()
+            
+            # Run warmup
+            if warmup_steps > 0:
+                for t in range(warmup_steps):
+                    network.step(
+                        inputs[i, t],
+                        apply_attention=apply_attention,
+                        apply_diffusion=apply_diffusion
+                    )
+            
+            # Collect predictions for this sample
+            result = network.forward(
+                inputs[i, warmup_steps:],
                 apply_attention=apply_attention,
                 apply_diffusion=apply_diffusion
             )
-    
-    # Collect predictions
-    result = network.forward(
-        inputs[warmup_steps:],
-        apply_attention=apply_attention,
-        apply_diffusion=apply_diffusion
-    )
-    
-    predictions = result['outputs']
-    targets_eval = targets[warmup_steps:]
+            
+            all_predictions.append(result['outputs'])
+            all_targets.append(targets[i, warmup_steps:])
+        
+        # Concatenate all samples
+        predictions = np.vstack(all_predictions)
+        targets_eval = np.vstack(all_targets)
+    else:
+        # Single sequence: (time_steps, input_dim)
+        network.reset_state()
+        
+        # Run warmup
+        if warmup_steps > 0:
+            for t in range(warmup_steps):
+                network.step(
+                    inputs[t],
+                    apply_attention=apply_attention,
+                    apply_diffusion=apply_diffusion
+                )
+        
+        # Collect predictions
+        result = network.forward(
+            inputs[warmup_steps:],
+            apply_attention=apply_attention,
+            apply_diffusion=apply_diffusion
+        )
+        
+        predictions = result['outputs']
+        targets_eval = targets[warmup_steps:]
     
     # Compute metrics
     metrics = {
@@ -304,6 +420,15 @@ def analyze_state_dynamics(
     mean_activity = np.mean(np.abs(states))
     max_activity = np.max(np.abs(states))
     
+    # Compute state norms
+    state_norms = np.linalg.norm(states, axis=1)
+    mean_norm = np.mean(state_norms)
+    std_norm = np.std(state_norms)
+    
+    # Compute value statistics
+    max_value = np.max(states)
+    min_value = np.min(states)
+    
     # Compute temporal correlation (autocorrelation at lag 1)
     if len(states) > 1:
         autocorr = np.mean([
@@ -328,6 +453,10 @@ def analyze_state_dynamics(
     return {
         'mean_activity': mean_activity,
         'max_activity': max_activity,
+        'mean_norm': mean_norm,
+        'std_norm': std_norm,
+        'max_value': max_value,
+        'min_value': min_value,
         'autocorrelation': autocorr,
         'participation_ratio': participation_ratio
     }

@@ -1,192 +1,698 @@
 #!/usr/bin/env python3
 """
-Demo script for Attention-Diffusion Recurrent Network
+Attention-Diffusion RNN Demo with Real-World Benchmarks
 
-This script demonstrates a unifying mechanism for attention and diffusion in a recurrent network:
-- The recurrent network serves as a reservoir with chaotic dynamics
-- W_att_rec converts recurrent state to an attention vector that multiplies the input
-- The projection from input to recurrent is untrained (random)
-- Readout weights from recurrent to output are trained
-- W_out_rec converts output to a "diffusion" vector that denoises the recurrent state
+This demo showcases the attention-diffusion reservoir network on classic
+time series prediction benchmarks:
 
-The demo includes:
-1. Synthetic task generation (temporal pattern recognition)
-2. Network initialization with attention and diffusion mechanisms
-3. Training with ridge regression
-4. Performance evaluation and comparison
-5. Visualization of attention patterns and state dynamics
+1. Mackey-Glass Chaotic Time Series - A standard reservoir computing benchmark
+2. NARMA-10 Nonlinear System - Tests memory and nonlinear processing
+3. Lorenz Attractor Prediction - Chaotic dynamics forecasting
+
+The architecture combines:
+- Echo State Network (chaotic reservoir with frozen weights)
+- Attention: reservoir state → input gating (dynamic feature selection)
+- Diffusion: output → state correction (self-stabilizing feedback)
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple
+from matplotlib.gridspec import GridSpec
 import sys
 import os
 
 # Import from the lib modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 from core import AttentionDiffusionRNN
-from utils import (
-    train_readout_ridge,
-    train_readout_online,
-    collect_states,
-    compute_mse,
-    compute_nmse,
-    compute_correlation,
-    evaluate_network,
-    analyze_attention,
-    analyze_state_dynamics,
-    generate_synthetic_task
-)
+from utils import train_readout_ridge, collect_states, evaluate_network, analyze_attention
 
+# ============================================================================
+# STYLING
+# ============================================================================
 
-def plot_results(results: Dict, save_path: str = None):
+# Modern color palette
+COLORS = {
+    'primary': '#2E86AB',      # Steel blue
+    'secondary': '#A23B72',    # Raspberry
+    'accent': '#F18F01',       # Orange
+    'success': '#C73E1D',      # Vermillion
+    'dark': '#1B1B1E',         # Almost black
+    'light': '#F5F5F5',        # Off white
+    'grid': '#E0E0E0',         # Light gray
+}
+
+def setup_plot_style():
+    """Configure matplotlib for modern, clean plots."""
+    plt.rcParams.update({
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'axes.edgecolor': COLORS['dark'],
+        'axes.labelcolor': COLORS['dark'],
+        'axes.titleweight': 'bold',
+        'axes.titlesize': 12,
+        'axes.labelsize': 10,
+        'xtick.color': COLORS['dark'],
+        'ytick.color': COLORS['dark'],
+        'text.color': COLORS['dark'],
+        'font.family': 'sans-serif',
+        'font.size': 10,
+        'legend.framealpha': 0.9,
+        'legend.edgecolor': COLORS['grid'],
+        'grid.color': COLORS['grid'],
+        'grid.linestyle': '-',
+        'grid.linewidth': 0.5,
+        'lines.linewidth': 1.5,
+    })
+
+setup_plot_style()
+
+# ============================================================================
+# REAL-WORLD DATASET GENERATORS
+# ============================================================================
+
+def generate_mackey_glass(n_samples: int, tau: int = 17, delta_t: float = 1.0,
+                          history_len: int = 1000, seed: int = None) -> np.ndarray:
     """
-    Plot comprehensive results including predictions, attention, and dynamics.
+    Generate the Mackey-Glass chaotic time series.
+    
+    The Mackey-Glass system is a classic benchmark for time series prediction,
+    exhibiting chaotic behavior for tau > 17.
+    
+    dx/dt = beta * x(t-tau) / (1 + x(t-tau)^n) - gamma * x(t)
     
     Args:
-        results: Dictionary containing predictions, targets, attention, and states
-        save_path: Optional path to save the figure
+        n_samples: Number of samples to generate
+        tau: Time delay (tau=17 gives mild chaos, tau=30 gives strong chaos)
+        delta_t: Time step for discretization
+        history_len: Initial transient to discard
+        seed: Random seed
+        
+    Returns:
+        Time series of shape (n_samples,)
     """
-    fig = plt.figure(figsize=(16, 12))
+    if seed is not None:
+        np.random.seed(seed)
     
-    # Plot 1: Predictions vs Targets
-    ax1 = plt.subplot(3, 2, 1)
-    time_steps = np.arange(len(results['predictions']))
-    ax1.plot(time_steps, results['targets'][:, 0], 'b-', label='Target', alpha=0.7, linewidth=2)
-    ax1.plot(time_steps, results['predictions'][:, 0], 'r--', label='Prediction', alpha=0.7, linewidth=2)
-    ax1.set_xlabel('Time Step')
-    ax1.set_ylabel('Output Value')
-    ax1.set_title('Predictions vs Targets (Dimension 0)')
-    ax1.legend()
+    beta = 0.2
+    gamma = 0.1
+    n_exp = 10
+    
+    # Total length including history
+    total_len = n_samples + history_len
+    
+    # Initialize with random values for the delay
+    x = np.zeros(total_len + tau)
+    x[:tau] = 0.9 + 0.2 * (np.random.rand(tau) - 0.5)
+    
+    # Runge-Kutta 4th order integration
+    for t in range(tau, total_len + tau - 1):
+        x_tau = x[t - tau]
+        x_t = x[t]
+        
+        # RK4 steps
+        k1 = delta_t * (beta * x_tau / (1 + x_tau**n_exp) - gamma * x_t)
+        k2 = delta_t * (beta * x_tau / (1 + x_tau**n_exp) - gamma * (x_t + k1/2))
+        k3 = delta_t * (beta * x_tau / (1 + x_tau**n_exp) - gamma * (x_t + k2/2))
+        k4 = delta_t * (beta * x_tau / (1 + x_tau**n_exp) - gamma * (x_t + k3))
+        
+        x[t + 1] = x_t + (k1 + 2*k2 + 2*k3 + k4) / 6
+    
+    # Discard transient and return
+    return x[tau + history_len:]
+
+
+def generate_narma(n_samples: int, order: int = 10, seed: int = None) -> tuple:
+    """
+    Generate the NARMA (Nonlinear Auto-Regressive Moving Average) system.
+    
+    NARMA-10 is a standard benchmark testing memory capacity and nonlinear
+    processing. The output depends on inputs up to 10 steps in the past.
+    
+    Args:
+        n_samples: Number of samples to generate
+        order: Order of the NARMA system (default 10)
+        seed: Random seed
+        
+    Returns:
+        Tuple of (inputs, targets) arrays
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Input: uniform random in [0, 0.5]
+    u = np.random.uniform(0, 0.5, n_samples + order)
+    y = np.zeros(n_samples + order)
+    
+    # NARMA-n recurrence relation
+    alpha = 0.3
+    beta = 0.05
+    gamma = 1.5
+    delta = 0.1
+    
+    for t in range(order, n_samples + order):
+        y[t] = (alpha * y[t-1] + 
+                beta * y[t-1] * np.sum(y[t-order:t]) + 
+                gamma * u[t-order] * u[t-1] + 
+                delta)
+        # Clip to prevent explosion
+        y[t] = np.clip(y[t], -1, 1)
+    
+    return u[order:], y[order:]
+
+
+def generate_lorenz(n_samples: int, dt: float = 0.01, 
+                    transient: int = 1000, seed: int = None) -> np.ndarray:
+    """
+    Generate the Lorenz attractor trajectory.
+    
+    The Lorenz system is the prototypical chaotic dynamical system,
+    often used to test prediction of chaotic dynamics.
+    
+    Args:
+        n_samples: Number of samples to generate
+        dt: Time step
+        transient: Initial transient to discard
+        seed: Random seed for initial conditions
+        
+    Returns:
+        Trajectory of shape (n_samples, 3) for (x, y, z)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Lorenz parameters
+    sigma = 10.0
+    rho = 28.0
+    beta = 8.0 / 3.0
+    
+    total_len = n_samples + transient
+    trajectory = np.zeros((total_len, 3))
+    
+    # Random initial conditions near the attractor
+    trajectory[0] = [1.0 + np.random.randn() * 0.1,
+                     1.0 + np.random.randn() * 0.1,
+                     1.0 + np.random.randn() * 0.1]
+    
+    # Integrate using RK4
+    for t in range(total_len - 1):
+        x, y, z = trajectory[t]
+        
+        # Derivatives
+        def lorenz_deriv(state):
+            x, y, z = state
+            return np.array([
+                sigma * (y - x),
+                x * (rho - z) - y,
+                x * y - beta * z
+            ])
+        
+        k1 = dt * lorenz_deriv(trajectory[t])
+        k2 = dt * lorenz_deriv(trajectory[t] + k1/2)
+        k3 = dt * lorenz_deriv(trajectory[t] + k2/2)
+        k4 = dt * lorenz_deriv(trajectory[t] + k3)
+        
+        trajectory[t + 1] = trajectory[t] + (k1 + 2*k2 + 2*k3 + k4) / 6
+    
+    return trajectory[transient:]
+
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+
+def plot_mackey_glass_results(t, true_signal, predictions, train_end, 
+                              metrics, save_path=None):
+    """Create a comprehensive visualization for Mackey-Glass prediction."""
+    
+    fig = plt.figure(figsize=(14, 10))
+    gs = GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.25)
+    
+    # Main prediction plot
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(t[:train_end], true_signal[:train_end], 
+             color=COLORS['primary'], alpha=0.6, label='Training Data', linewidth=1)
+    ax1.plot(t[train_end:], true_signal[train_end:], 
+             color=COLORS['primary'], label='True Signal', linewidth=1.5)
+    ax1.plot(t[train_end:], predictions, 
+             color=COLORS['accent'], linestyle='--', label='Prediction', linewidth=1.5)
+    ax1.axvline(x=t[train_end], color=COLORS['secondary'], linestyle=':', 
+                alpha=0.7, label='Train/Test Split')
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('x(t)')
+    ax1.set_title('Mackey-Glass Chaotic Time Series Prediction', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Prediction Error
-    ax2 = plt.subplot(3, 2, 2)
-    errors = np.abs(results['predictions'] - results['targets'])
-    ax2.plot(time_steps, errors[:, 0], 'g-', linewidth=2)
+    # Zoomed prediction
+    ax2 = fig.add_subplot(gs[1, 0])
+    zoom_start = 0
+    zoom_len = min(200, len(predictions))
+    ax2.plot(true_signal[train_end:train_end+zoom_len], 
+             color=COLORS['primary'], label='True', linewidth=1.5)
+    ax2.plot(predictions[:zoom_len], 
+             color=COLORS['accent'], linestyle='--', label='Predicted', linewidth=1.5)
     ax2.set_xlabel('Time Step')
-    ax2.set_ylabel('Absolute Error')
-    ax2.set_title('Prediction Error Over Time')
+    ax2.set_ylabel('x(t)')
+    ax2.set_title('Prediction Detail (First 200 Test Steps)')
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
     
-    # Plot 3: Attention Patterns
-    ax3 = plt.subplot(3, 2, 3)
-    if 'attention' in results and results['attention'] is not None:
-        attention_data = results['attention']
-        im = ax3.imshow(attention_data.T, aspect='auto', cmap='hot', interpolation='nearest')
-        ax3.set_xlabel('Time Step')
-        ax3.set_ylabel('Input Dimension')
-        ax3.set_title('Attention Patterns Over Time')
-        plt.colorbar(im, ax=ax3, label='Attention Weight')
-    else:
-        ax3.text(0.5, 0.5, 'No attention data', ha='center', va='center')
-        ax3.set_title('Attention Patterns (N/A)')
+    # Error distribution
+    ax3 = fig.add_subplot(gs[1, 1])
+    errors = predictions - true_signal[train_end:train_end+len(predictions)]
+    ax3.hist(errors, bins=50, color=COLORS['secondary'], alpha=0.7, edgecolor='white')
+    ax3.axvline(x=0, color=COLORS['dark'], linestyle='--', linewidth=1)
+    ax3.axvline(x=np.mean(errors), color=COLORS['accent'], linestyle='-', 
+                linewidth=2, label=f'Mean: {np.mean(errors):.4f}')
+    ax3.set_xlabel('Prediction Error')
+    ax3.set_ylabel('Frequency')
+    ax3.set_title('Error Distribution')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
     
-    # Plot 4: State Dynamics (first 5 dimensions)
-    ax4 = plt.subplot(3, 2, 4)
-    if 'states' in results and results['states'] is not None:
-        states_data = results['states']
-        n_dims_to_plot = min(5, states_data.shape[1])
-        for i in range(n_dims_to_plot):
-            ax4.plot(time_steps, states_data[:, i], label=f'Dim {i}', alpha=0.7)
-        ax4.set_xlabel('Time Step')
-        ax4.set_ylabel('State Value')
-        ax4.set_title('Recurrent State Dynamics (First 5 Dims)')
-        ax4.legend(loc='upper right', fontsize=8)
-        ax4.grid(True, alpha=0.3)
-    else:
-        ax4.text(0.5, 0.5, 'No state data', ha='center', va='center')
-        ax4.set_title('State Dynamics (N/A)')
+    # Scatter plot
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.scatter(true_signal[train_end:train_end+len(predictions)], predictions, 
+                alpha=0.3, s=10, color=COLORS['primary'])
+    lims = [min(ax4.get_xlim()[0], ax4.get_ylim()[0]),
+            max(ax4.get_xlim()[1], ax4.get_ylim()[1])]
+    ax4.plot(lims, lims, color=COLORS['success'], linestyle='--', linewidth=2, label='Perfect Fit')
+    ax4.set_xlim(lims)
+    ax4.set_ylim(lims)
+    ax4.set_xlabel('True Value')
+    ax4.set_ylabel('Predicted Value')
+    ax4.set_title(f'Prediction Accuracy (R² = {metrics["correlation"]**2:.4f})')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    ax4.set_aspect('equal')
     
-    # Plot 5: Attention Statistics
-    ax5 = plt.subplot(3, 2, 5)
-    if 'attention' in results and results['attention'] is not None:
-        attention_stats = analyze_attention(results['attention'])
-        mean_att = attention_stats['mean_attention']
-        std_att = attention_stats['std_attention']
-        dims = np.arange(len(mean_att))
-        ax5.bar(dims, mean_att, yerr=std_att, alpha=0.7, color='orange', capsize=5)
-        ax5.set_xlabel('Input Dimension')
-        ax5.set_ylabel('Mean Attention Weight')
-        ax5.set_title('Average Attention per Input Dimension')
-        ax5.grid(True, alpha=0.3, axis='y')
-    else:
-        ax5.text(0.5, 0.5, 'No attention data', ha='center', va='center')
-        ax5.set_title('Attention Statistics (N/A)')
-    
-    # Plot 6: State Space Trajectory (2D projection)
-    ax6 = plt.subplot(3, 2, 6)
-    if 'states' in results and results['states'] is not None:
-        states_data = results['states']
-        # Use first two dimensions for visualization
-        ax6.plot(states_data[:, 0], states_data[:, 1], 'b-', alpha=0.5, linewidth=1)
-        ax6.scatter(states_data[0, 0], states_data[0, 1], c='green', s=100, 
-                   marker='o', label='Start', zorder=5)
-        ax6.scatter(states_data[-1, 0], states_data[-1, 1], c='red', s=100, 
-                   marker='x', label='End', zorder=5)
-        ax6.set_xlabel('State Dimension 0')
-        ax6.set_ylabel('State Dimension 1')
-        ax6.set_title('State Space Trajectory (2D Projection)')
-        ax6.legend()
-        ax6.grid(True, alpha=0.3)
-    else:
-        ax6.text(0.5, 0.5, 'No state data', ha='center', va='center')
-        ax6.set_title('State Space (N/A)')
+    # Metrics summary
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.axis('off')
+    metrics_text = f"""
+    ╔══════════════════════════════════════╗
+    ║       PERFORMANCE METRICS            ║
+    ╠══════════════════════════════════════╣
+    ║                                      ║
+    ║   MSE:          {metrics['mse']:.6f}           ║
+    ║   NMSE:         {metrics['nmse']:.6f}           ║
+    ║   Correlation:  {metrics['correlation']:.6f}           ║
+    ║   R²:           {metrics['correlation']**2:.6f}           ║
+    ║                                      ║
+    ╚══════════════════════════════════════╝
+    """
+    ax5.text(0.1, 0.5, metrics_text, transform=ax5.transAxes,
+             fontsize=11, fontfamily='monospace', verticalalignment='center',
+             bbox=dict(boxstyle='round', facecolor=COLORS['light'], alpha=0.8))
     
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Figure saved to {save_path}")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"  → Saved: {save_path}")
     
     plt.show()
 
 
-def compare_configurations(task_type: str = 'temporal_pattern'):
+def plot_attention_analysis(attention_data, inputs, save_path=None):
+    """Visualize how attention weights evolve and correlate with inputs."""
+    
+    fig = plt.figure(figsize=(14, 8))
+    gs = GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # Attention heatmap
+    ax1 = fig.add_subplot(gs[0, :2])
+    im = ax1.imshow(attention_data.T, aspect='auto', cmap='YlOrRd', 
+                    interpolation='bilinear')
+    ax1.set_xlabel('Time Step')
+    ax1.set_ylabel('Input Dimension')
+    ax1.set_title('Attention Weights Over Time', fontweight='bold')
+    cbar = plt.colorbar(im, ax=ax1)
+    cbar.set_label('Attention Weight')
+    
+    # Attention statistics
+    ax2 = fig.add_subplot(gs[0, 2])
+    mean_att = np.mean(attention_data, axis=0)
+    std_att = np.std(attention_data, axis=0)
+    dims = np.arange(len(mean_att))
+    ax2.barh(dims, mean_att, xerr=std_att, color=COLORS['accent'], 
+             alpha=0.8, capsize=3, edgecolor='white')
+    ax2.set_ylabel('Input Dimension')
+    ax2.set_xlabel('Mean Attention')
+    ax2.set_title('Attention Distribution')
+    ax2.grid(True, alpha=0.3, axis='x')
+    ax2.invert_yaxis()
+    
+    # Attention dynamics (3 dimensions)
+    ax3 = fig.add_subplot(gs[1, 0])
+    n_show = min(3, attention_data.shape[1])
+    colors = [COLORS['primary'], COLORS['secondary'], COLORS['accent']]
+    for i in range(n_show):
+        ax3.plot(attention_data[:300, i], color=colors[i], 
+                 label=f'Dim {i}', alpha=0.8, linewidth=1.2)
+    ax3.set_xlabel('Time Step')
+    ax3.set_ylabel('Attention Weight')
+    ax3.set_title('Attention Dynamics (First 300 Steps)')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Attention variance
+    ax4 = fig.add_subplot(gs[1, 1])
+    att_var = np.var(attention_data, axis=1)
+    ax4.fill_between(range(len(att_var)), att_var, alpha=0.5, color=COLORS['secondary'])
+    ax4.plot(att_var, color=COLORS['secondary'], linewidth=0.5)
+    ax4.set_xlabel('Time Step')
+    ax4.set_ylabel('Attention Variance')
+    ax4.set_title('Attention Selectivity Over Time')
+    ax4.grid(True, alpha=0.3)
+    
+    # Attention entropy
+    ax5 = fig.add_subplot(gs[1, 2])
+    # Normalize attention to probabilities
+    att_prob = attention_data / (attention_data.sum(axis=1, keepdims=True) + 1e-10)
+    entropy = -np.sum(att_prob * np.log(att_prob + 1e-10), axis=1)
+    ax5.plot(entropy, color=COLORS['primary'], linewidth=1)
+    ax5.axhline(y=np.log(attention_data.shape[1]), color=COLORS['success'], 
+                linestyle='--', label='Max Entropy')
+    ax5.set_xlabel('Time Step')
+    ax5.set_ylabel('Entropy')
+    ax5.set_title('Attention Entropy (Concentration)')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"  → Saved: {save_path}")
+    
+    plt.show()
+
+
+def plot_comparison(results, save_path=None):
+    """Visualize the comparison between different configurations."""
+    
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    
+    configs = [r['config'] for r in results]
+    short_names = ['Baseline', 'Attention', 'Diffusion', 'Full Model']
+    
+    mse = [r['metrics']['mse'] for r in results]
+    nmse = [r['metrics']['nmse'] for r in results]
+    corr = [r['metrics']['correlation'] for r in results]
+    
+    colors = [COLORS['dark'], COLORS['primary'], COLORS['secondary'], COLORS['accent']]
+    
+    # MSE comparison
+    bars1 = axes[0].bar(short_names, mse, color=colors, alpha=0.8, edgecolor='white', linewidth=2)
+    axes[0].set_ylabel('Mean Squared Error')
+    axes[0].set_title('MSE Comparison (Lower is Better)', fontweight='bold')
+    axes[0].grid(True, alpha=0.3, axis='y')
+    axes[0].tick_params(axis='x', rotation=15)
+    
+    # NMSE comparison
+    bars2 = axes[1].bar(short_names, nmse, color=colors, alpha=0.8, edgecolor='white', linewidth=2)
+    axes[1].set_ylabel('Normalized MSE')
+    axes[1].set_title('NMSE Comparison (Lower is Better)', fontweight='bold')
+    axes[1].grid(True, alpha=0.3, axis='y')
+    axes[1].tick_params(axis='x', rotation=15)
+    
+    # Correlation comparison
+    bars3 = axes[2].bar(short_names, corr, color=colors, alpha=0.8, edgecolor='white', linewidth=2)
+    axes[2].set_ylabel('Correlation')
+    axes[2].set_title('Correlation (Higher is Better)', fontweight='bold')
+    axes[2].set_ylim([min(0.9, min(corr) - 0.05), 1.0])
+    axes[2].grid(True, alpha=0.3, axis='y')
+    axes[2].tick_params(axis='x', rotation=15)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"  → Saved: {save_path}")
+    
+    plt.show()
+
+
+def plot_state_dynamics(states, save_path=None):
+    """Visualize reservoir state dynamics."""
+    
+    fig = plt.figure(figsize=(14, 8))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
+    
+    # 3D state trajectory
+    ax1 = fig.add_subplot(gs[0, 0], projection='3d')
+    # Use PCA for dimensionality reduction
+    from numpy.linalg import svd
+    states_centered = states - states.mean(axis=0)
+    U, S, Vt = svd(states_centered, full_matrices=False)
+    states_3d = U[:, :3] * S[:3]
+    
+    ax1.plot(states_3d[:, 0], states_3d[:, 1], states_3d[:, 2], 
+             color=COLORS['primary'], alpha=0.6, linewidth=0.5)
+    ax1.scatter(states_3d[0, 0], states_3d[0, 1], states_3d[0, 2], 
+                color='green', s=100, marker='o', label='Start')
+    ax1.scatter(states_3d[-1, 0], states_3d[-1, 1], states_3d[-1, 2], 
+                color='red', s=100, marker='x', label='End')
+    ax1.set_xlabel('PC1')
+    ax1.set_ylabel('PC2')
+    ax1.set_zlabel('PC3')
+    ax1.set_title('State Trajectory (PCA Projection)', fontweight='bold')
+    ax1.legend()
+    
+    # State activation distribution
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.hist(states.flatten(), bins=100, color=COLORS['primary'], 
+             alpha=0.7, edgecolor='white', density=True)
+    ax2.set_xlabel('Activation Value')
+    ax2.set_ylabel('Density')
+    ax2.set_title('Reservoir Activation Distribution')
+    ax2.grid(True, alpha=0.3)
+    
+    # State norms over time
+    ax3 = fig.add_subplot(gs[1, 0])
+    norms = np.linalg.norm(states, axis=1)
+    ax3.plot(norms, color=COLORS['secondary'], linewidth=1)
+    ax3.axhline(y=np.mean(norms), color=COLORS['accent'], linestyle='--', 
+                label=f'Mean: {np.mean(norms):.2f}')
+    ax3.fill_between(range(len(norms)), norms, alpha=0.3, color=COLORS['secondary'])
+    ax3.set_xlabel('Time Step')
+    ax3.set_ylabel('State Norm ||h(t)||')
+    ax3.set_title('Reservoir Activity Over Time')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Principal component variance
+    ax4 = fig.add_subplot(gs[1, 1])
+    variance_explained = (S ** 2) / np.sum(S ** 2)
+    cumulative = np.cumsum(variance_explained)
+    ax4.bar(range(min(20, len(variance_explained))), 
+            variance_explained[:20] * 100, 
+            color=COLORS['primary'], alpha=0.7, label='Individual')
+    ax4.plot(range(min(20, len(cumulative))), 
+             cumulative[:20] * 100, 
+             color=COLORS['accent'], marker='o', markersize=4, label='Cumulative')
+    ax4.set_xlabel('Principal Component')
+    ax4.set_ylabel('Variance Explained (%)')
+    ax4.set_title('Reservoir Dimensionality (PCA)')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"  → Saved: {save_path}")
+    
+    plt.show()
+
+
+# ============================================================================
+# DEMO FUNCTIONS
+# ============================================================================
+
+def demo_mackey_glass():
     """
-    Compare different network configurations (with/without attention and diffusion).
+    Demonstrate the network on Mackey-Glass chaotic time series prediction.
     
-    Args:
-        task_type: Type of synthetic task to generate
+    This is the classic reservoir computing benchmark - predicting the next
+    value of a chaotic system from its delayed embedding.
     """
-    print("\n" + "="*80)
-    print("COMPARING NETWORK CONFIGURATIONS")
-    print("="*80)
+    print("\n" + "="*70)
+    print("  MACKEY-GLASS CHAOTIC TIME SERIES PREDICTION")
+    print("="*70)
     
-    # Generate synthetic task
-    n_samples = 500
-    input_dim = 10
-    output_dim = 3
-    seq_length = 100
-    noise_level = 0.05
+    # Generate data
+    print("\n[1] Generating Mackey-Glass time series (τ=17)...")
+    n_total = 5000
+    tau = 17
+    mg_series = generate_mackey_glass(n_total, tau=tau, seed=42)
     
-    print(f"\nGenerating synthetic task: {task_type}")
-    print(f"  Samples: {n_samples}, Input dim: {input_dim}, Output dim: {output_dim}")
-    print(f"  Sequence length: {seq_length}, Noise level: {noise_level}")
+    # Create delayed embedding as input features
+    embedding_dim = 10
+    delay = 1
     
-    inputs, targets = generate_synthetic_task(
-        task_type=task_type,
-        n_samples=n_samples,
-        input_dim=input_dim,
-        output_dim=output_dim,
-        seq_length=seq_length,
-        noise_level=noise_level,
+    # Prepare input/output pairs
+    X = np.zeros((n_total - embedding_dim * delay, embedding_dim))
+    for i in range(embedding_dim):
+        X[:, i] = mg_series[i * delay : n_total - (embedding_dim - i) * delay]
+    
+    # Target: predict next value
+    y = mg_series[embedding_dim * delay:]
+    
+    # Normalize
+    X_mean, X_std = X.mean(), X.std()
+    y_mean, y_std = y.mean(), y.std()
+    X = (X - X_mean) / X_std
+    y = (y - y_mean) / y_std
+    
+    # Train/test split
+    train_size = 3000
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+    
+    print(f"  → Training samples: {train_size}")
+    print(f"  → Test samples: {len(X_test)}")
+    print(f"  → Input dimension: {embedding_dim}")
+    
+    # Create network
+    print("\n[2] Initializing Attention-Diffusion RNN...")
+    network = AttentionDiffusionRNN(
+        input_dim=embedding_dim,
+        recurrent_dim=500,
+        output_dim=1,
+        spectral_radius=1.2,
+        input_scaling=0.5,
+        attention_scaling=0.3,
+        diffusion_scaling=0.2,
+        leak_rate=0.3,
         seed=42
     )
+    print(f"  → Reservoir size: 500")
+    print(f"  → Spectral radius: 1.2")
+    print(f"  → Attention + Diffusion: ENABLED")
     
-    # Split into train and test
-    train_size = int(0.7 * n_samples)
-    train_inputs, test_inputs = inputs[:train_size], inputs[train_size:]
-    train_targets, test_targets = targets[:train_size], targets[train_size:]
+    # Collect states
+    print("\n[3] Collecting reservoir states...")
+    warmup = 100
     
-    print(f"  Train samples: {train_size}, Test samples: {n_samples - train_size}")
+    network.reset_state()
+    train_states = []
+    train_attentions = []
     
-    # Network configuration
-    reservoir_size = 200
-    spectral_radius = 1.2
-    input_scaling = 0.5
-    leak_rate = 0.3
+    for t in range(len(X_train)):
+        _, state, attention = network.step(X_train[t], 
+                                           apply_attention=True, 
+                                           apply_diffusion=True)
+        if t >= warmup:
+            train_states.append(state)
+            train_attentions.append(attention)
+    
+    train_states = np.array(train_states)
+    train_attentions = np.array(train_attentions)
+    train_targets = y_train[warmup:]
+    
+    print(f"  → State matrix shape: {train_states.shape}")
+    
+    # Train readout
+    print("\n[4] Training readout (Ridge Regression)...")
+    W_out, b_out = train_readout_ridge(train_states, train_targets.reshape(-1, 1), 
+                                        ridge_param=1e-4)
+    network.W_out = W_out
+    network.b_out = b_out
+    print(f"  → Readout weights: {W_out.shape}")
+    
+    # Test
+    print("\n[5] Evaluating on test set...")
+    network.reset_state()
+    
+    # Warmup on end of training data
+    for t in range(warmup):
+        network.step(X_train[-(warmup-t)], apply_attention=True, apply_diffusion=True)
+    
+    predictions = []
+    test_states = []
+    
+    for t in range(len(X_test)):
+        output, state, _ = network.step(X_test[t], 
+                                        apply_attention=True, 
+                                        apply_diffusion=True)
+        predictions.append(output[0])
+        test_states.append(state)
+    
+    predictions = np.array(predictions)
+    test_states = np.array(test_states)
+    
+    # Calculate metrics
+    from utils import compute_mse, compute_nmse, compute_correlation
+    metrics = {
+        'mse': compute_mse(predictions, y_test),
+        'nmse': compute_nmse(predictions, y_test),
+        'correlation': compute_correlation(predictions, y_test)
+    }
+    
+    print(f"\n  ╔════════════════════════════════╗")
+    print(f"  ║     TEST SET PERFORMANCE       ║")
+    print(f"  ╠════════════════════════════════╣")
+    print(f"  ║  MSE:         {metrics['mse']:.6f}        ║")
+    print(f"  ║  NMSE:        {metrics['nmse']:.6f}        ║")
+    print(f"  ║  Correlation: {metrics['correlation']:.6f}        ║")
+    print(f"  ╚════════════════════════════════╝")
+    
+    # Visualizations
+    print("\n[6] Generating visualizations...")
+    
+    t = np.arange(len(mg_series))
+    plot_mackey_glass_results(
+        t[embedding_dim * delay:], 
+        y * y_std + y_mean,  # Denormalize for plotting
+        predictions * y_std + y_mean,
+        train_size,
+        metrics,
+        save_path='results_mackey_glass.png'
+    )
+    
+    plot_attention_analysis(
+        train_attentions,
+        X_train[warmup:],
+        save_path='results_attention_analysis.png'
+    )
+    
+    plot_state_dynamics(
+        test_states,
+        save_path='results_state_dynamics.png'
+    )
+    
+    return metrics
+
+
+def demo_configuration_comparison():
+    """
+    Compare performance with/without attention and diffusion.
+    """
+    print("\n" + "="*70)
+    print("  ABLATION STUDY: ATTENTION & DIFFUSION IMPACT")
+    print("="*70)
+    
+    # Generate Mackey-Glass data
+    print("\n[1] Preparing benchmark data...")
+    n_total = 3000
+    mg_series = generate_mackey_glass(n_total, tau=17, seed=42)
+    
+    embedding_dim = 8
+    X = np.zeros((n_total - embedding_dim, embedding_dim))
+    for i in range(embedding_dim):
+        X[:, i] = mg_series[i : n_total - (embedding_dim - i)]
+    y = mg_series[embedding_dim:]
+    
+    X = (X - X.mean()) / X.std()
+    y = (y - y.mean()) / y.std()
+    
+    train_size = 2000
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+    
+    print(f"  → Train/Test: {train_size}/{len(X_test)}")
     
     configurations = [
         {'name': 'Baseline (No Attention, No Diffusion)', 
@@ -199,356 +705,273 @@ def compare_configurations(task_type: str = 'temporal_pattern'):
          'attention': True, 'diffusion': True},
     ]
     
-    results_comparison = []
+    results = []
+    warmup = 100
+    
+    print("\n[2] Running experiments...")
     
     for config in configurations:
-        print(f"\n{'-'*80}")
-        print(f"Configuration: {config['name']}")
-        print(f"{'-'*80}")
+        print(f"\n  Testing: {config['name']}")
         
-        # Create network
         network = AttentionDiffusionRNN(
-            input_dim=input_dim,
-            reservoir_size=reservoir_size,
-            output_dim=output_dim,
-            spectral_radius=spectral_radius,
-            input_scaling=input_scaling,
-            leak_rate=leak_rate,
-            use_attention=config['attention'],
-            use_diffusion=config['diffusion'],
+            input_dim=embedding_dim,
+            recurrent_dim=300,
+            output_dim=1,
+            spectral_radius=1.2,
+            input_scaling=0.5,
+            attention_scaling=0.3,
+            diffusion_scaling=0.2,
+            leak_rate=0.3,
             seed=42
         )
         
         # Collect training states
-        print("Collecting training states...")
-        train_data = collect_states(
-            network, 
-            train_inputs, 
-            apply_attention=config['attention'],
-            apply_diffusion=config['diffusion'],
-            warmup_steps=50
-        )
+        network.reset_state()
+        train_states = []
         
-        # Train readout with ridge regression
-        print("Training readout weights with ridge regression...")
-        W_out, bias = train_readout_ridge(
-            train_data['states'], 
-            train_targets,
-            ridge_param=1e-4
-        )
+        for t in range(len(X_train)):
+            _, state, _ = network.step(X_train[t], 
+                                       apply_attention=config['attention'], 
+                                       apply_diffusion=config['diffusion'])
+            if t >= warmup:
+                train_states.append(state)
         
-        # Set trained weights
+        train_states = np.array(train_states)
+        train_targets = y_train[warmup:]
+        
+        # Train
+        W_out, b_out = train_readout_ridge(train_states, train_targets.reshape(-1, 1), 
+                                            ridge_param=1e-4)
         network.W_out = W_out
-        network.bias_out = bias
+        network.b_out = b_out
         
-        # Evaluate on test set
-        print("Evaluating on test set...")
-        metrics = evaluate_network(
-            network,
-            test_inputs,
-            test_targets,
-            apply_attention=config['attention'],
-            apply_diffusion=config['diffusion'],
-            warmup_steps=50
-        )
+        # Test
+        network.reset_state()
+        for t in range(warmup):
+            network.step(X_train[-(warmup-t)], 
+                        apply_attention=config['attention'], 
+                        apply_diffusion=config['diffusion'])
         
-        print(f"\nTest Performance:")
-        print(f"  MSE:         {metrics['mse']:.6f}")
-        print(f"  NMSE:        {metrics['nmse']:.6f}")
-        print(f"  Correlation: {metrics['correlation']:.6f}")
+        predictions = []
+        for t in range(len(X_test)):
+            output, _, _ = network.step(X_test[t], 
+                                        apply_attention=config['attention'], 
+                                        apply_diffusion=config['diffusion'])
+            predictions.append(output[0])
         
-        results_comparison.append({
-            'config': config['name'],
-            'metrics': metrics
-        })
+        predictions = np.array(predictions)
+        
+        from utils import compute_mse, compute_nmse, compute_correlation
+        metrics = {
+            'mse': compute_mse(predictions, y_test),
+            'nmse': compute_nmse(predictions, y_test),
+            'correlation': compute_correlation(predictions, y_test)
+        }
+        
+        print(f"    MSE: {metrics['mse']:.6f}  |  Corr: {metrics['correlation']:.4f}")
+        
+        results.append({'config': config['name'], 'metrics': metrics})
     
-    # Print comparison summary
-    print("\n" + "="*80)
-    print("PERFORMANCE COMPARISON SUMMARY")
-    print("="*80)
-    print(f"{'Configuration':<45} {'MSE':<12} {'NMSE':<12} {'Correlation':<12}")
-    print("-"*80)
-    for result in results_comparison:
-        print(f"{result['config']:<45} "
-              f"{result['metrics']['mse']:<12.6f} "
-              f"{result['metrics']['nmse']:<12.6f} "
-              f"{result['metrics']['correlation']:<12.6f}")
-    print("="*80)
+    # Print summary
+    print("\n" + "="*70)
+    print("  RESULTS SUMMARY")
+    print("="*70)
+    print(f"\n  {'Configuration':<40} {'MSE':<12} {'NMSE':<12} {'Corr':<10}")
+    print("  " + "-"*70)
+    for r in results:
+        print(f"  {r['config']:<40} {r['metrics']['mse']:<12.6f} "
+              f"{r['metrics']['nmse']:<12.6f} {r['metrics']['correlation']:<10.4f}")
+    
+    # Plot comparison
+    print("\n[3] Generating comparison plot...")
+    plot_comparison(results, save_path='results_comparison.png')
+    
+    return results
 
 
-def detailed_demo():
+def demo_narma():
     """
-    Detailed demonstration of the attention-diffusion RNN with visualization.
+    Test on NARMA-10, a challenging memory and nonlinearity benchmark.
     """
-    print("\n" + "="*80)
-    print("DETAILED ATTENTION-DIFFUSION RNN DEMONSTRATION")
-    print("="*80)
+    print("\n" + "="*70)
+    print("  NARMA-10 NONLINEAR SYSTEM IDENTIFICATION")
+    print("="*70)
     
-    # Task parameters
-    task_type = 'memory'
-    n_samples = 300
-    input_dim = 8
-    output_dim = 2
-    seq_length = 150
-    noise_level = 0.1
+    print("\n[1] Generating NARMA-10 data...")
+    n_total = 4000
+    u, y = generate_narma(n_total, order=10, seed=42)
     
-    print(f"\nTask Configuration:")
-    print(f"  Type: {task_type}")
-    print(f"  Samples: {n_samples}")
-    print(f"  Input dimension: {input_dim}")
-    print(f"  Output dimension: {output_dim}")
-    print(f"  Sequence length: {seq_length}")
-    print(f"  Noise level: {noise_level}")
+    # Normalize
+    u = (u - u.mean()) / u.std()
+    y = (y - y.mean()) / y.std()
     
-    # Generate data
-    print("\nGenerating synthetic data...")
-    inputs, targets = generate_synthetic_task(
-        task_type=task_type,
-        n_samples=n_samples,
-        input_dim=input_dim,
-        output_dim=output_dim,
-        seq_length=seq_length,
-        noise_level=noise_level,
-        seed=123
-    )
+    train_size = 3000
+    u_train, u_test = u[:train_size], u[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
     
-    # Split data
-    train_size = int(0.8 * n_samples)
-    train_inputs, test_inputs = inputs[:train_size], inputs[train_size:]
-    train_targets, test_targets = targets[:train_size], targets[train_size:]
+    print(f"  → Train/Test: {train_size}/{len(u_test)}")
     
-    print(f"  Training samples: {train_size}")
-    print(f"  Test samples: {n_samples - train_size}")
+    print("\n[2] Training Attention-Diffusion RNN...")
     
-    # Create network with full attention and diffusion
-    print("\nInitializing Attention-Diffusion RNN...")
     network = AttentionDiffusionRNN(
-        input_dim=input_dim,
-        reservoir_size=300,
-        output_dim=output_dim,
-        spectral_radius=1.3,
-        input_scaling=0.6,
-        leak_rate=0.4,
-        use_attention=True,
-        use_diffusion=True,
-        attention_strength=0.5,
-        diffusion_strength=0.3,
-        seed=123
+        input_dim=1,
+        recurrent_dim=400,
+        output_dim=1,
+        spectral_radius=0.95,  # NARMA needs more stable dynamics
+        input_scaling=0.8,
+        attention_scaling=0.2,
+        diffusion_scaling=0.15,
+        leak_rate=0.2,
+        seed=42
     )
     
-    config = network.get_config()
-    print(f"  Reservoir size: {config['reservoir_size']}")
-    print(f"  Spectral radius: {config['spectral_radius']}")
-    print(f"  Input scaling: {config['input_scaling']}")
-    print(f"  Leak rate: {config['leak_rate']}")
-    print(f"  Attention enabled: {config['use_attention']}")
-    print(f"  Diffusion enabled: {config['use_diffusion']}")
-    print(f"  Attention strength: {config['attention_strength']}")
-    print(f"  Diffusion strength: {config['diffusion_strength']}")
+    warmup = 100
     
-    # Collect training states
-    print("\nCollecting training states...")
-    train_data = collect_states(
-        network,
-        train_inputs,
-        apply_attention=True,
-        apply_diffusion=True,
-        warmup_steps=50
-    )
-    
-    print(f"  Collected states shape: {train_data['states'].shape}")
-    print(f"  Collected attention shape: {train_data['attention'].shape}")
-    
-    # Analyze state dynamics
-    print("\nAnalyzing state dynamics...")
-    dynamics = analyze_state_dynamics(train_data['states'])
-    print(f"  Mean state norm: {dynamics['mean_norm']:.4f}")
-    print(f"  Std state norm: {dynamics['std_norm']:.4f}")
-    print(f"  Max state value: {dynamics['max_value']:.4f}")
-    print(f"  Min state value: {dynamics['min_value']:.4f}")
-    
-    # Train readout
-    print("\nTraining readout weights...")
-    W_out, bias = train_readout_ridge(
-        train_data['states'],
-        train_targets,
-        ridge_param=1e-3
-    )
-    network.W_out = W_out
-    network.bias_out = bias
-    print(f"  Readout weights shape: {W_out.shape}")
-    print(f"  Bias shape: {bias.shape}")
-    
-    # Evaluate on training set
-    print("\nEvaluating on training set...")
-    train_metrics = evaluate_network(
-        network,
-        train_inputs,
-        train_targets,
-        apply_attention=True,
-        apply_diffusion=True,
-        warmup_steps=50
-    )
-    print(f"  Training MSE: {train_metrics['mse']:.6f}")
-    print(f"  Training NMSE: {train_metrics['nmse']:.6f}")
-    print(f"  Training Correlation: {train_metrics['correlation']:.6f}")
-    
-    # Evaluate on test set
-    print("\nEvaluating on test set...")
-    test_metrics = evaluate_network(
-        network,
-        test_inputs,
-        test_targets,
-        apply_attention=True,
-        apply_diffusion=True,
-        warmup_steps=50
-    )
-    print(f"  Test MSE: {test_metrics['mse']:.6f}")
-    print(f"  Test NMSE: {test_metrics['nmse']:.6f}")
-    print(f"  Test Correlation: {test_metrics['correlation']:.6f}")
-    
-    # Collect detailed results for visualization
-    print("\nCollecting detailed results for visualization...")
-    test_sample_idx = 0
+    # Collect states
     network.reset_state()
+    train_states = []
+    
+    for t in range(len(u_train)):
+        _, state, _ = network.step(np.array([u_train[t]]), 
+                                   apply_attention=True, 
+                                   apply_diffusion=True)
+        if t >= warmup:
+            train_states.append(state)
+    
+    train_states = np.array(train_states)
+    train_targets = y_train[warmup:]
+    
+    # Train
+    W_out, b_out = train_readout_ridge(train_states, train_targets.reshape(-1, 1), 
+                                        ridge_param=1e-3)
+    network.W_out = W_out
+    network.b_out = b_out
+    
+    # Test
+    network.reset_state()
+    for t in range(warmup):
+        network.step(np.array([u_train[-(warmup-t)]]), 
+                    apply_attention=True, apply_diffusion=True)
     
     predictions = []
-    states_list = []
-    attention_list = []
-    
-    for t in range(seq_length):
-        output, state, attention = network.step(
-            test_inputs[test_sample_idx, t],
-            apply_attention=True,
-            apply_diffusion=True
-        )
-        predictions.append(output)
-        states_list.append(state)
-        if attention is not None:
-            attention_list.append(attention)
+    for t in range(len(u_test)):
+        output, _, _ = network.step(np.array([u_test[t]]), 
+                                    apply_attention=True, 
+                                    apply_diffusion=True)
+        predictions.append(output[0])
     
     predictions = np.array(predictions)
-    states_array = np.array(states_list)
-    attention_array = np.array(attention_list) if attention_list else None
     
-    # Prepare results dictionary
-    results = {
-        'predictions': predictions,
-        'targets': test_targets[test_sample_idx],
-        'states': states_array,
-        'attention': attention_array
+    from utils import compute_mse, compute_nmse, compute_correlation
+    metrics = {
+        'mse': compute_mse(predictions, y_test),
+        'nmse': compute_nmse(predictions, y_test),
+        'correlation': compute_correlation(predictions, y_test)
     }
     
-    # Plot results
-    print("\nGenerating visualization...")
-    plot_results(results, save_path='attention_diffusion_results.png')
+    print(f"\n  ╔════════════════════════════════╗")
+    print(f"  ║   NARMA-10 TEST PERFORMANCE    ║")
+    print(f"  ╠════════════════════════════════╣")
+    print(f"  ║  MSE:         {metrics['mse']:.6f}        ║")
+    print(f"  ║  NMSE:        {metrics['nmse']:.6f}        ║")
+    print(f"  ║  Correlation: {metrics['correlation']:.6f}        ║")
+    print(f"  ╚════════════════════════════════╝")
     
-    print("\n" + "="*80)
-    print("DEMONSTRATION COMPLETE")
-    print("="*80)
-
-
-def online_training_demo():
-    """
-    Demonstrate online training of readout weights.
-    """
-    print("\n" + "="*80)
-    print("ONLINE TRAINING DEMONSTRATION")
-    print("="*80)
+    # Quick plot
+    print("\n[3] Generating visualization...")
     
-    # Generate simple task
-    print("\nGenerating synthetic task...")
-    inputs, targets = generate_synthetic_task(
-        task_type='sine_wave',
-        n_samples=200,
-        input_dim=5,
-        output_dim=2,
-        seq_length=100,
-        noise_level=0.05,
-        seed=456
-    )
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
     
-    # Create network
-    print("\nInitializing network...")
-    network = AttentionDiffusionRNN(
-        input_dim=5,
-        reservoir_size=150,
-        output_dim=2,
-        spectral_radius=1.1,
-        input_scaling=0.5,
-        leak_rate=0.3,
-        use_attention=True,
-        use_diffusion=True,
-        seed=456
-    )
+    axes[0].plot(y_test[:500], color=COLORS['primary'], label='True', linewidth=1.5)
+    axes[0].plot(predictions[:500], color=COLORS['accent'], linestyle='--', 
+                 label='Predicted', linewidth=1.5)
+    axes[0].set_xlabel('Time Step')
+    axes[0].set_ylabel('Output')
+    axes[0].set_title('NARMA-10 Prediction (First 500 Test Steps)', fontweight='bold')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
     
-    # Train online
-    print("\nTraining with online gradient descent...")
-    losses = train_readout_online(
-        network,
-        inputs,
-        targets,
-        learning_rate=0.001,
-        n_epochs=20,
-        apply_attention=True,
-        apply_diffusion=True
-    )
+    axes[1].scatter(y_test, predictions, alpha=0.3, s=10, color=COLORS['primary'])
+    lims = [min(axes[1].get_xlim()[0], axes[1].get_ylim()[0]),
+            max(axes[1].get_xlim()[1], axes[1].get_ylim()[1])]
+    axes[1].plot(lims, lims, color=COLORS['success'], linestyle='--', linewidth=2)
+    axes[1].set_xlim(lims)
+    axes[1].set_ylim(lims)
+    axes[1].set_xlabel('True Value')
+    axes[1].set_ylabel('Predicted Value')
+    axes[1].set_title(f'Prediction Accuracy (R² = {metrics["correlation"]**2:.4f})')
+    axes[1].set_aspect('equal')
+    axes[1].grid(True, alpha=0.3)
     
-    print(f"\nTraining complete!")
-    print(f"  Initial loss: {losses[0]:.6f}")
-    print(f"  Final loss: {losses[-1]:.6f}")
-    print(f"  Improvement: {(losses[0] - losses[-1]) / losses[0] * 100:.2f}%")
-    
-    # Plot training curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(losses, 'b-', linewidth=2)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (MSE)')
-    plt.title('Online Training Progress')
-    plt.grid(True, alpha=0.3)
-    plt.savefig('online_training_curve.png', dpi=150, bbox_inches='tight')
-    print("\nTraining curve saved to 'online_training_curve.png'")
+    plt.tight_layout()
+    plt.savefig('results_narma10.png', dpi=150, bbox_inches='tight', facecolor='white')
+    print(f"  → Saved: results_narma10.png")
     plt.show()
+    
+    return metrics
 
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    """
-    Main demonstration function.
-    """
-    print("\n" + "="*80)
-    print("ATTENTION-DIFFUSION RECURRENT NETWORK DEMO")
-    print("="*80)
-    print("\nThis demo showcases a unifying mechanism for attention and diffusion")
-    print("in a recurrent network with the following key features:")
-    print("  1. Chaotic reservoir dynamics (untrained recurrent weights)")
-    print("  2. Attention mechanism: W_att_rec converts state to attention vector")
-    print("  3. Untrained input projection (random W_in)")
-    print("  4. Trained readout weights (W_out)")
-    print("  5. Diffusion mechanism: W_out_rec denoises recurrent state")
-    print("\n" + "="*80)
+    """Run all demonstrations."""
+    
+    print("\n" + "█"*70)
+    print("█" + " "*68 + "█")
+    print("█" + "   ATTENTION-DIFFUSION RECURRENT NEURAL NETWORK".center(68) + "█")
+    print("█" + "   Real-World Benchmark Demonstration".center(68) + "█")
+    print("█" + " "*68 + "█")
+    print("█"*70)
+    
+    print("""
+    This demo tests the Attention-Diffusion RNN architecture on classic
+    time series benchmarks used in reservoir computing research:
+    
+    • Mackey-Glass: Chaotic time series prediction (τ=17)
+    • NARMA-10: Nonlinear system with 10-step memory
+    • Ablation: Impact of attention and diffusion mechanisms
+    
+    Architecture highlights:
+    ┌─────────────────────────────────────────────────────────┐
+    │  FROZEN: Input weights (W_in), Reservoir (W_rec)        │
+    │  TRAINED: Output weights (W_out) via Ridge Regression   │
+    │  ATTENTION: h(t) → gates on input features              │
+    │  DIFFUSION: y(t) → state denoising correction           │
+    └─────────────────────────────────────────────────────────┘
+    """)
     
     try:
-        # Run detailed demo with visualization
-        detailed_demo()
+        # Run demonstrations
+        print("\n" + "="*70)
+        mg_metrics = demo_mackey_glass()
         
-        # Compare different configurations
-        compare_configurations(task_type='temporal_pattern')
+        print("\n" + "="*70)
+        comparison_results = demo_configuration_comparison()
         
-        # Demonstrate online training
-        online_training_demo()
+        print("\n" + "="*70)
+        narma_metrics = demo_narma()
         
-        print("\n" + "="*80)
-        print("ALL DEMONSTRATIONS COMPLETED SUCCESSFULLY!")
-        print("="*80)
-        print("\nGenerated files:")
-        print("  - attention_diffusion_results.png")
-        print("  - online_training_curve.png")
-        print("\n")
+        # Final summary
+        print("\n" + "█"*70)
+        print("█" + " "*68 + "█")
+        print("█" + "   ALL DEMONSTRATIONS COMPLETED SUCCESSFULLY!".center(68) + "█")
+        print("█" + " "*68 + "█")
+        print("█"*70)
+        
+        print("\n  Generated files:")
+        print("    • results_mackey_glass.png     - Prediction visualization")
+        print("    • results_attention_analysis.png - Attention mechanism analysis")
+        print("    • results_state_dynamics.png   - Reservoir state analysis")
+        print("    • results_comparison.png       - Ablation study results")
+        print("    • results_narma10.png          - NARMA-10 results")
+        print()
         
     except Exception as e:
-        print(f"\n{'='*80}")
+        print(f"\n{'='*70}")
         print(f"ERROR: {str(e)}")
-        print(f"{'='*80}")
+        print(f"{'='*70}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
